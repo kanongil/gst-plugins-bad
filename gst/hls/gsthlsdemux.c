@@ -924,7 +924,6 @@ gst_hls_demux_update_thread (GstHLSDemux * demux)
     /* update the playlist for live sources */
     if (gst_m3u8_client_is_live (demux->client)) {
       if (!gst_hls_demux_update_playlist (demux)) {
-        demux->client->update_failed_count++;
         if (demux->client->update_failed_count < DEFAULT_FAILED_COUNT) {
           GST_WARNING_OBJECT (demux, "Could not update the playlist");
           gst_hls_demux_schedule (demux);
@@ -955,7 +954,6 @@ gst_hls_demux_update_thread (GstHLSDemux * demux)
     if (g_queue_is_empty (demux->queue)) {
       if (!gst_hls_demux_get_next_fragment (demux)) {
         if (!demux->end_of_playlist && !demux->cancelled) {
-          demux->client->update_failed_count++;
           if (demux->client->update_failed_count < DEFAULT_FAILED_COUNT) {
             GST_WARNING_OBJECT (demux, "Could not fetch the next fragment");
             continue;
@@ -1154,7 +1152,7 @@ gst_hls_src_buf_to_utf8_playlist (gchar * data, guint size)
 
   /* alloc size + 1 to end with a null character */
   playlist = g_malloc0 (size + 1);
-  memcpy (playlist, data, size + 1);
+  memcpy (playlist, data, size);
   return playlist;
 }
 
@@ -1178,8 +1176,7 @@ gst_hls_demux_update_playlist (GstHLSDemux * demux)
     GST_WARNING_OBJECT (demux, "Couldn't not validate playlist encoding");
     return FALSE;
   }
-  gst_m3u8_client_update (demux->client, playlist);
-  return TRUE;
+  return gst_m3u8_client_update (demux->client, playlist);
 }
 
 static gboolean

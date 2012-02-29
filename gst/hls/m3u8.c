@@ -219,7 +219,7 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
 {
   gint val;
   GstClockTime duration;
-  gchar *title, *end;
+  gchar *title, *buf, *end;
 //  gboolean discontinuity;
   GstM3U8 *list;
 
@@ -245,7 +245,7 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
   }
 
   g_free (self->last_data);
-  self->last_data = data;
+  self->last_data = g_strdup (data);
 
   if (self->files) {
     g_list_foreach (self->files, (GFunc) gst_m3u8_media_file_free, NULL);
@@ -253,6 +253,7 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
     self->files = NULL;
   }
 
+  buf = data;
   list = NULL;
   duration = 0;
   title = NULL;
@@ -391,6 +392,8 @@ gst_m3u8_update (GstM3U8 * self, gchar * data, gboolean * updated)
     data = g_utf8_next_char (end);      /* skip \n */
   }
 
+  g_free (buf);
+
   /* redorder playlists by bitrate */
   if (self->lists) {
     gchar *top_variant_uri = NULL;
@@ -464,13 +467,11 @@ gst_m3u8_client_update (GstM3U8Client * self, gchar * data)
   GST_M3U8_CLIENT_LOCK (self);
   m3u8 = self->current ? self->current : self->main;
 
-  if (!gst_m3u8_update (m3u8, data, &updated))
-    goto out;
-
-  if (!updated) {
+  if (!gst_m3u8_update (m3u8, data, &updated) || !updated) {
     self->update_failed_count++;
     goto out;
   }
+  self->update_failed_count = 0;
 
   /* select the first playlist, for now */
   if (!self->current) {
