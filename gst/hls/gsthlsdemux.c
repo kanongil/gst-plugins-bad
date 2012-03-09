@@ -1342,8 +1342,9 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux)
       GST_INFO_OBJECT (demux, "Input source caps: %" GST_PTR_FORMAT,
           demux->input_caps);
       demux->do_typefind = FALSE;
-    } else
-      gst_caps_unref (caps);
+    }
+
+    gst_caps_unref (caps);
   }
   gst_buffer_set_caps (buf, demux->input_caps);
 
