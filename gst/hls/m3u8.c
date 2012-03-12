@@ -494,28 +494,21 @@ out:
   return ret;
 }
 
-static gboolean
+static gint
 _find_next (GstM3U8MediaFile * file, GstM3U8Client * client)
 {
-  GST_DEBUG ("Found fragment %d", file->sequence);
-  if (file->sequence >= client->sequence)
-    return FALSE;
-  return TRUE;
+  return (file->sequence < client->sequence);
 }
 
 void
 gst_m3u8_client_get_current_position (GstM3U8Client * client,
     GstClockTime * timestamp)
 {
-  GList *l;
   GList *walk;
-
-  l = g_list_find_custom (client->current->files, client,
-      (GCompareFunc) _find_next);
 
   *timestamp = 0;
   for (walk = client->current->files; walk; walk = walk->next) {
-    if (walk == l)
+    if (_find_next (GST_M3U8_MEDIA_FILE (walk->data), client) == 0)
       break;
     *timestamp += GST_M3U8_MEDIA_FILE (walk->data)->duration;
   }
@@ -552,6 +545,7 @@ gst_m3u8_client_get_next_fragment (GstM3U8Client * client,
   *uri = file->uri;
   *duration = file->duration;
 
+  GST_DEBUG ("Found fragment %d", file->sequence);
   GST_M3U8_CLIENT_UNLOCK (client);
   return TRUE;
 }
