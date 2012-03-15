@@ -60,11 +60,6 @@ static GstStaticPadTemplate sinktemplate = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS ("application/x-hls"));
 
-static GstStaticPadTemplate fetchertemplate = GST_STATIC_PAD_TEMPLATE ("sink",
-    GST_PAD_SINK,
-    GST_PAD_ALWAYS,
-    GST_STATIC_CAPS_ANY);
-
 GST_DEBUG_CATEGORY_STATIC (gst_hls_demux_debug);
 #define GST_CAT_DEFAULT gst_hls_demux_debug
 
@@ -95,20 +90,12 @@ static GstStateChangeReturn
 gst_hls_demux_change_state (GstElement * element, GstStateChange transition);
 
 /* GstHLSDemux */
-static GstBusSyncReply gst_hls_demux_fetcher_bus_handler (GstBus * bus,
-    GstMessage * message, gpointer data);
 static GstFlowReturn gst_hls_demux_chain (GstPad * pad, GstBuffer * buf);
 static gboolean gst_hls_demux_sink_event (GstPad * pad, GstEvent * event);
 static gboolean gst_hls_demux_src_event (GstPad * pad, GstEvent * event);
 static gboolean gst_hls_demux_src_query (GstPad * pad, GstQuery * query);
-static GstFlowReturn gst_hls_demux_fetcher_chain (GstPad * pad,
-    GstBuffer * buf);
-static gboolean gst_hls_demux_fetcher_sink_event (GstPad * pad,
-    GstEvent * event);
 static void gst_hls_demux_loop (GstHLSDemux * demux);
 static void gst_hls_demux_stop (GstHLSDemux * demux);
-static void gst_hls_demux_stop_fetcher_locked (GstHLSDemux * demux,
-    gboolean cancelled);
 static void gst_hls_demux_stop_update (GstHLSDemux * demux);
 static gboolean gst_hls_demux_start_update (GstHLSDemux * demux);
 static gboolean gst_hls_demux_cache_fragments (GstHLSDemux * demux);
@@ -153,9 +140,6 @@ gst_hls_demux_dispose (GObject * obj)
 {
   GstHLSDemux *demux = GST_HLS_DEMUX (obj);
 
-  g_cond_free (demux->fetcher_cond);
-  g_mutex_free (demux->fetcher_lock);
-
   g_cond_free (demux->thread_cond);
   g_mutex_free (demux->thread_lock);
 
@@ -163,13 +147,10 @@ gst_hls_demux_dispose (GObject * obj)
   gst_object_unref (demux->task);
   g_static_rec_mutex_free (&demux->task_lock);
 
-  gst_object_unref (demux->fetcher_bus);
-  gst_object_unref (demux->fetcherpad);
-
   gst_hls_demux_reset (demux, TRUE);
 
   g_queue_free (demux->queue);
-  gst_object_unref (demux->download);
+  g_object_unref (demux->downloader);
 
   G_OBJECT_CLASS (parent_class)->dispose (obj);
 }
@@ -216,30 +197,17 @@ gst_hls_demux_init (GstHLSDemux * demux, GstHLSDemuxClass * klass)
       GST_DEBUG_FUNCPTR (gst_hls_demux_sink_event));
   gst_element_add_pad (GST_ELEMENT (demux), demux->sinkpad);
 
-  /* fetcher pad */
-  demux->fetcherpad =
-      gst_pad_new_from_static_template (&fetchertemplate, "sink");
-  gst_pad_set_chain_function (demux->fetcherpad,
-      GST_DEBUG_FUNCPTR (gst_hls_demux_fetcher_chain));
-  gst_pad_set_event_function (demux->fetcherpad,
-      GST_DEBUG_FUNCPTR (gst_hls_demux_fetcher_sink_event));
-  gst_pad_set_element_private (demux->fetcherpad, demux);
-  gst_pad_activate_push (demux->fetcherpad, TRUE);
-
   demux->do_typefind = TRUE;
+
+  /* Downloader */
+  demux->downloader = gst_uri_downloader_new ();
 
   /* Properties */
   demux->fragments_cache = DEFAULT_FRAGMENTS_CACHE;
   demux->bitrate_switch_tol = DEFAULT_BITRATE_SWITCH_TOLERANCE;
 
-  demux->download = gst_adapter_new ();
-  demux->fetcher_bus = gst_bus_new ();
-  gst_bus_set_sync_handler (demux->fetcher_bus,
-      gst_hls_demux_fetcher_bus_handler, demux);
   demux->thread_cond = g_cond_new ();
   demux->thread_lock = g_mutex_new ();
-  demux->fetcher_cond = g_cond_new ();
-  demux->fetcher_lock = g_mutex_new ();
   demux->queue = g_queue_new ();
   g_static_rec_mutex_init (&demux->task_lock);
   /* FIXME: This really should be a pad task instead */
@@ -315,6 +283,7 @@ gst_hls_demux_change_state (GstElement * element, GstStateChange transition)
       break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
       demux->cancelled = TRUE;
+      gst_uri_downloader_cancel (demux->downloader);
       gst_hls_demux_stop (demux);
       gst_task_join (demux->task);
       gst_hls_demux_reset (demux, FALSE);
@@ -390,10 +359,8 @@ gst_hls_demux_src_event (GstPad * pad, GstEvent * event)
       }
 
       demux->cancelled = TRUE;
+      gst_uri_downloader_cancel (demux->downloader);
       gst_task_pause (demux->task);
-      g_mutex_lock (demux->fetcher_lock);
-      gst_hls_demux_stop_fetcher_locked (demux, TRUE);
-      g_mutex_unlock (demux->fetcher_lock);
       gst_hls_demux_stop_update (demux);
       gst_task_pause (demux->task);
 
@@ -406,7 +373,6 @@ gst_hls_demux_src_event (GstPad * pad, GstEvent * event)
         gst_buffer_unref (buf);
       }
       g_queue_clear (demux->queue);
-      gst_adapter_clear (demux->download);
 
       GST_M3U8_CLIENT_LOCK (demux->client);
       GST_DEBUG_OBJECT (demux, "seeking to sequence %d", current_sequence);
@@ -570,27 +536,6 @@ gst_hls_demux_src_query (GstPad * pad, GstQuery * query)
   return ret;
 }
 
-static gboolean
-gst_hls_demux_fetcher_sink_event (GstPad * pad, GstEvent * event)
-{
-  GstHLSDemux *demux = GST_HLS_DEMUX (gst_pad_get_element_private (pad));
-
-  switch (event->type) {
-    case GST_EVENT_EOS:{
-      GST_DEBUG_OBJECT (demux, "Got EOS on the fetcher pad");
-      /* signal we have fetched the URI */
-      if (!demux->cancelled) {
-        g_cond_broadcast (demux->fetcher_cond);
-      }
-    }
-    default:
-      break;
-  }
-
-  gst_event_unref (event);
-  return FALSE;
-}
-
 static GstFlowReturn
 gst_hls_demux_chain (GstPad * pad, GstBuffer * buf)
 {
@@ -606,70 +551,10 @@ gst_hls_demux_chain (GstPad * pad, GstBuffer * buf)
   return GST_FLOW_OK;
 }
 
-static GstFlowReturn
-gst_hls_demux_fetcher_chain (GstPad * pad, GstBuffer * buf)
-{
-  GstHLSDemux *demux = GST_HLS_DEMUX (gst_pad_get_element_private (pad));
-
-  /* The source element can be an http source element. In case we get a 404,
-   * the html response will be sent downstream and the adapter
-   * will not be null, which might make us think that the request proceed
-   * successfully. But it will also post an error message in the bus that
-   * is handled synchronously and that will set demux->fetcher_error to TRUE,
-   * which is used to discard this buffer with the html response. */
-  if (demux->fetcher_error) {
-    goto done;
-  }
-
-  gst_adapter_push (demux->download, buf);
-
-done:
-  {
-    return GST_FLOW_OK;
-  }
-}
-
-static void
-gst_hls_demux_stop_fetcher_locked (GstHLSDemux * demux, gboolean cancelled)
-{
-  GstPad *pad;
-
-  /* When the fetcher is stopped while it's downloading, we will get an EOS that
-   * unblocks the fetcher thread and tries to stop it again from that thread.
-   * Here we check if the fetcher as already been stopped before continuing */
-  if (demux->fetcher == NULL || demux->stopping_fetcher)
-    return;
-
-  GST_DEBUG_OBJECT (demux, "Stopping fetcher.");
-  demux->stopping_fetcher = TRUE;
-  /* set the element state to NULL */
-  gst_element_set_state (demux->fetcher, GST_STATE_NULL);
-  gst_element_get_state (demux->fetcher, NULL, NULL, GST_CLOCK_TIME_NONE);
-  /* unlink it from the internal pad */
-  pad = gst_pad_get_peer (demux->fetcherpad);
-  if (pad) {
-    gst_pad_unlink (pad, demux->fetcherpad);
-    gst_object_unref (pad);
-  }
-  /* and finally unref it */
-  gst_object_unref (demux->fetcher);
-  demux->fetcher = NULL;
-
-  /* if we stopped it to cancell a download, free the cached buffer */
-  if (cancelled && gst_adapter_available (demux->download)) {
-    gst_adapter_clear (demux->download);
-  }
-  /* signal the fetcher thread that the download has finished/cancelled */
-  if (cancelled)
-    g_cond_broadcast (demux->fetcher_cond);
-}
-
 static void
 gst_hls_demux_stop (GstHLSDemux * demux)
 {
-  g_mutex_lock (demux->fetcher_lock);
-  gst_hls_demux_stop_fetcher_locked (demux, TRUE);
-  g_mutex_unlock (demux->fetcher_lock);
+  gst_uri_downloader_cancel (demux->downloader);
   gst_task_stop (demux->task);
   gst_hls_demux_stop_update (demux);
 }
@@ -807,50 +692,6 @@ pause_task:
   }
 }
 
-static GstBusSyncReply
-gst_hls_demux_fetcher_bus_handler (GstBus * bus,
-    GstMessage * message, gpointer data)
-{
-  GstHLSDemux *demux = GST_HLS_DEMUX (data);
-
-  if (GST_MESSAGE_TYPE (message) == GST_MESSAGE_ERROR) {
-    demux->fetcher_error = TRUE;
-    if (!demux->cancelled) {
-      g_mutex_lock (demux->fetcher_lock);
-      g_cond_broadcast (demux->fetcher_cond);
-      g_mutex_unlock (demux->fetcher_lock);
-    }
-  }
-
-  gst_message_unref (message);
-  return GST_BUS_DROP;
-}
-
-static gboolean
-gst_hls_demux_make_fetcher_locked (GstHLSDemux * demux, const gchar * uri)
-{
-  GstPad *pad;
-
-  if (!gst_uri_is_valid (uri))
-    return FALSE;
-
-  GST_DEBUG_OBJECT (demux, "Creating fetcher for the URI:%s", uri);
-  demux->fetcher = gst_element_make_from_uri (GST_URI_SRC, uri, NULL);
-  if (!demux->fetcher)
-    return FALSE;
-
-  demux->fetcher_error = FALSE;
-  demux->stopping_fetcher = FALSE;
-  gst_element_set_bus (GST_ELEMENT (demux->fetcher), demux->fetcher_bus);
-
-  pad = gst_element_get_static_pad (demux->fetcher, "src");
-  if (pad) {
-    gst_pad_link (pad, demux->fetcherpad);
-    gst_object_unref (pad);
-  }
-  return TRUE;
-}
-
 static void
 gst_hls_demux_reset (GstHLSDemux * demux, gboolean dispose)
 {
@@ -870,8 +711,6 @@ gst_hls_demux_reset (GstHLSDemux * demux, gboolean dispose)
     gst_buffer_unref (demux->playlist);
     demux->playlist = NULL;
   }
-
-  gst_adapter_clear (demux->download);
 
   if (demux->client) {
     gst_m3u8_client_free (demux->client);
@@ -1082,66 +921,6 @@ gst_hls_demux_cache_fragments (GstHLSDemux * demux)
   return TRUE;
 }
 
-static gboolean
-gst_hls_demux_fetch_location (GstHLSDemux * demux, const gchar * uri)
-{
-  GstStateChangeReturn ret;
-  gboolean bret = FALSE;
-
-  g_mutex_lock (demux->fetcher_lock);
-
-  while (demux->fetcher)
-    g_cond_wait (demux->fetcher_cond, demux->fetcher_lock);
-
-  if (demux->cancelled)
-    goto quit;
-
-  if (!gst_hls_demux_make_fetcher_locked (demux, uri)) {
-    goto uri_error;
-  }
-
-  ret = gst_element_set_state (demux->fetcher, GST_STATE_PLAYING);
-  if (ret == GST_STATE_CHANGE_FAILURE)
-    goto state_change_error;
-
-  /* wait until we have fetched the uri */
-  GST_DEBUG_OBJECT (demux, "Waiting to fetch the URI");
-  g_cond_wait (demux->fetcher_cond, demux->fetcher_lock);
-
-  gst_hls_demux_stop_fetcher_locked (demux, FALSE);
-
-  if (!demux->fetcher_error && gst_adapter_available (demux->download)) {
-    GST_INFO_OBJECT (demux, "URI fetched successfully");
-    bret = TRUE;
-  }
-  goto quit;
-
-uri_error:
-  {
-    GST_ELEMENT_ERROR (demux, RESOURCE, OPEN_READ,
-        ("Could not create an element to fetch the given URI."), ("URI: \"%s\"",
-            uri));
-    bret = FALSE;
-    goto quit;
-  }
-
-state_change_error:
-  {
-    GST_ELEMENT_ERROR (demux, CORE, STATE_CHANGE,
-        ("Error changing state of the fetcher element."), (NULL));
-    bret = FALSE;
-    goto quit;
-  }
-
-quit:
-  {
-    /* Unlock any other fetcher that might be waiting */
-    g_cond_broadcast (demux->fetcher_cond);
-    g_mutex_unlock (demux->fetcher_lock);
-    return bret;
-  }
-}
-
 static gchar *
 gst_hls_src_buf_to_utf8_playlist (gchar * data, guint size)
 {
@@ -1159,19 +938,21 @@ gst_hls_src_buf_to_utf8_playlist (gchar * data, guint size)
 static gboolean
 gst_hls_demux_update_playlist (GstHLSDemux * demux)
 {
+  GstAdapter *download;
   const guint8 *data;
   gchar *playlist;
   guint avail;
   const gchar *uri = gst_m3u8_client_get_current_uri (demux->client);
 
   GST_INFO_OBJECT (demux, "Updating the playlist %s", uri);
-  if (!gst_hls_demux_fetch_location (demux, uri))
+  download = gst_uri_downloader_fetch_uri (demux->downloader, uri);
+  if (download == NULL)
     return FALSE;
 
-  avail = gst_adapter_available (demux->download);
-  data = gst_adapter_peek (demux->download, avail);
+  avail = gst_adapter_available (download);
+  data = gst_adapter_peek (download, avail);
   playlist = gst_hls_src_buf_to_utf8_playlist ((gchar *) data, avail);
-  gst_adapter_clear (demux->download);
+  g_object_unref (download);
   if (playlist == NULL) {
     GST_WARNING_OBJECT (demux, "Couldn't not validate playlist encoding");
     return FALSE;
@@ -1300,6 +1081,7 @@ gst_hls_demux_switch_playlist (GstHLSDemux * demux)
 static gboolean
 gst_hls_demux_get_next_fragment (GstHLSDemux * demux)
 {
+  GstAdapter *download;
   GstBuffer *buf;
   guint avail;
   const gchar *next_fragment_uri;
@@ -1317,7 +1099,9 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux)
 
   GST_INFO_OBJECT (demux, "Fetching next fragment %s", next_fragment_uri);
 
-  if (!gst_hls_demux_fetch_location (demux, next_fragment_uri)) {
+  download =
+      gst_uri_downloader_fetch_uri (demux->downloader, next_fragment_uri);
+  if (download == NULL) {
     /* FIXME: The gst_m3u8_get_next_fragment increments the sequence number
        but another thread might call get_next_fragment and this decrement
        will not redownload the failed fragment, but might duplicate the
@@ -1327,8 +1111,8 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux)
     return FALSE;
   }
 
-  avail = gst_adapter_available (demux->download);
-  buf = gst_adapter_take_buffer (demux->download, avail);
+  avail = gst_adapter_available (download);
+  buf = gst_adapter_take_buffer (download, avail);
   GST_BUFFER_DURATION (buf) = duration;
   GST_BUFFER_TIMESTAMP (buf) = timestamp;
 
@@ -1355,6 +1139,6 @@ gst_hls_demux_get_next_fragment (GstHLSDemux * demux)
 
   g_queue_push_tail (demux->queue, buf);
   gst_task_start (demux->task);
-  gst_adapter_clear (demux->download);
+  g_object_unref (download);
   return TRUE;
 }

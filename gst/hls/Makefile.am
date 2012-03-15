@@ -4,7 +4,8 @@ plugin_LTLIBRARIES = libgstfragmented.la
 libgstfragmented_la_SOURCES =			\
 	m3u8.c					\
 	gsthlsdemux.c				\
-	gstfragmentedplugin.c
+	gstfragmentedplugin.c	\
+	gsturidownloader.c
 
 libgstfragmented_la_CFLAGS = $(GST_PLUGINS_BAD_CFLAGS) $(GST_BASE_CFLAGS) $(GST_CFLAGS) $(SOUP_CFLAGS)
 libgstfragmented_la_LIBADD = $(GST_BASE_LIBS) $(GST_LIBS) $(SOUP_LIBS)
@@ -15,7 +16,8 @@ libgstfragmented_la_LIBTOOLFLAGS = --tag=disable-static
 noinst_HEADERS = 			\
 	gstfragmented.h		\
 	gsthlsdemux.h			\
-	m3u8.h
+	m3u8.h	\
+	gsturidownloader.h
 
 Android.mk: Makefile.am $(BUILT_SOURCES)
 	androgenizer \
