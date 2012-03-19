@@ -1238,8 +1238,7 @@ mpegts_base_get_tags_from_eit (MpegTSBase * base, GstStructure * eit_info)
 }
 
 static void
-remove_each_program (gpointer key, MpegTSBaseProgram * program,
-    MpegTSBase * base)
+remove_each_program (MpegTSBaseProgram * program, MpegTSBase * base)
 {
   /* First deactivate it */
   mpegts_base_deactivate_program (base, program);
@@ -1250,7 +1249,9 @@ remove_each_program (gpointer key, MpegTSBaseProgram * program,
 static gboolean
 gst_mpegts_base_handle_eos (MpegTSBase * base)
 {
-  g_hash_table_foreach (base->programs, (GHFunc) remove_each_program, base);
+  GList *remove_list = g_hash_table_get_values (base->programs);
+  g_list_foreach (remove_list, (GFunc) remove_each_program, base);
+  g_list_free (remove_list);
   /* finally remove  */
   return TRUE;
 }
